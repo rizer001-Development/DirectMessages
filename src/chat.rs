@@ -1,114 +1,139 @@
-//! Interactive chat loop: a sending thread (stdin) and a receiving thread
-//! (socket), coordinated so either side can end the conversation.
+//! Non-blocking chat session for the TUI: owns the write half and the sending
+//! key, and runs a background thread that reads, decrypts, and forwards
+//! incoming events over a channel.
 
-use std::io::{self, BufRead, Write};
+use std::io;
 use std::net::{Shutdown, TcpStream};
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Receiver};
 
 use crate::crypto::{SessionReceiver, SessionSender};
 use crate::protocol::{read_frame, write_frame};
 
-/// Run the interactive chat until either side quits or disconnects.
-pub fn run_chat(
-    stream: TcpStream,
-    mut sender: SessionSender,
-    mut receiver: SessionReceiver,
-) -> Result<()> {
-    let mut write_stream = stream
-        .try_clone()
-        .context("failed to clone stream for reading")?;
-    let mut read_stream = stream;
+/// Events produced by the receiving thread.
+pub enum ChatEvent {
+    Message(String),
+    Disconnected,
+    Error(String),
+}
 
-    let (tx, rx) = unbounded::<()>();
+/// A line in the chat history.
+pub enum ChatLine {
+    Me(String),
+    Peer(String),
+    System(String),
+}
 
-    // Receiving thread: read frames, decrypt, print.
-    let tx_recv = tx.clone();
-    let recv_handle = thread::spawn(move || {
-        loop {
-            match read_frame(&mut read_stream) {
-                Ok(frame) => match receiver.decrypt(&frame) {
-                    Ok(plain) => {
-                        print!("\r[peer] {}\n> ", String::from_utf8_lossy(&plain));
-                        io::stdout().flush().ok();
-                    }
-                    Err(e) => {
-                        eprintln!("\rdecrypt failed: {e}");
-                        break;
-                    }
-                },
-                Err(e) => {
-                    match e.kind() {
-                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => {
-                            println!("\r[peer disconnected]");
-                        }
-                        _ => eprintln!("\rconnection error: {e}"),
-                    }
-                    break;
-                }
-            }
-        }
-        let _ = tx_recv.send(());
-    });
+/// An active chat with a connected peer.
+pub struct ChatSession {
+    write_stream: TcpStream,
+    sender: SessionSender,
+    rx: Receiver<ChatEvent>,
+    recv_handle: Option<JoinHandle<()>>,
+    pub history: Vec<ChatLine>,
+    pub input: String,
+    /// Lines scrolled up from the bottom (0 = pinned to the latest message).
+    pub scroll: usize,
+    pub peer_short_fp: String,
+    pub ended: bool,
+}
 
-    // Sending thread: read stdin, encrypt, send.
-    let tx_send = tx.clone();
-    let send_handle = thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut handle = stdin.lock();
-        let mut line = String::new();
+impl ChatSession {
+    pub fn new(
+        stream: TcpStream,
+        sender: SessionSender,
+        receiver: SessionReceiver,
+        peer_short_fp: String,
+    ) -> Result<Self> {
+        let mut read_stream = stream.try_clone().context("failed to clone stream")?;
+        let (tx, rx) = unbounded::<ChatEvent>();
 
-        print!("> ");
-        io::stdout().flush().ok();
-
-        loop {
-            line.clear();
-            match handle.read_line(&mut line) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    let trimmed = line.trim_end();
-                    if trimmed == "/quit" || trimmed == "/exit" {
-                        break;
-                    }
-                    if trimmed.is_empty() {
-                        print!("> ");
-                        io::stdout().flush().ok();
-                        continue;
-                    }
-                    match sender.encrypt(trimmed.as_bytes()) {
-                        Ok(ciphertext) => {
-                            if let Err(e) = write_frame(&mut write_stream, &ciphertext) {
-                                eprintln!("\rsend failed: {e}");
+        let recv_handle = thread::spawn(move || {
+            let mut receiver = receiver;
+            loop {
+                match read_frame(&mut read_stream) {
+                    Ok(frame) => match receiver.decrypt(&frame) {
+                        Ok(plain) => {
+                            let text = String::from_utf8_lossy(&plain).into_owned();
+                            if tx.send(ChatEvent::Message(text)).is_err() {
                                 break;
                             }
                         }
                         Err(e) => {
-                            eprintln!("\rencrypt failed: {e}");
+                            let _ = tx.send(ChatEvent::Error(format!("decrypt failed: {e}")));
                             break;
                         }
+                    },
+                    Err(e) => {
+                        let event = match e.kind() {
+                            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => {
+                                ChatEvent::Disconnected
+                            }
+                            _ => ChatEvent::Error(format!("connection error: {e}")),
+                        };
+                        let _ = tx.send(event);
+                        break;
                     }
-                    print!("> ");
-                    io::stdout().flush().ok();
                 }
-                Err(e) => {
-                    eprintln!("\rstdin error: {e}");
-                    break;
+            }
+        });
+
+        Ok(ChatSession {
+            write_stream: stream,
+            sender,
+            rx,
+            recv_handle: Some(recv_handle),
+            history: Vec::new(),
+            input: String::new(),
+            scroll: 0,
+            peer_short_fp,
+            ended: false,
+        })
+    }
+
+    /// Add a system line to the history.
+    pub fn push_system(&mut self, text: impl Into<String>) {
+        self.history.push(ChatLine::System(text.into()));
+    }
+
+    /// Encrypt and send the current input, appending it to history.
+    pub fn send(&mut self) -> Result<()> {
+        let text = self.input.trim_end().to_string();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let ciphertext = self.sender.encrypt(text.as_bytes())?;
+        write_frame(&mut self.write_stream, &ciphertext)?;
+        self.history.push(ChatLine::Me(text));
+        self.input.clear();
+        Ok(())
+    }
+
+    /// Drain any pending events from the receiving thread.
+    pub fn drain_events(&mut self) {
+        while let Ok(event) = self.rx.try_recv() {
+            match event {
+                ChatEvent::Message(text) => self.history.push(ChatLine::Peer(text)),
+                ChatEvent::Disconnected => {
+                    self.history
+                        .push(ChatLine::System("[peer disconnected]".to_string()));
+                    self.ended = true;
+                }
+                ChatEvent::Error(e) => {
+                    self.history.push(ChatLine::System(format!("error: {e}")));
+                    self.ended = true;
                 }
             }
         }
+    }
 
-        // Close our side of the socket so the peer sees a clean EOF.
-        let _ = write_stream.shutdown(Shutdown::Both);
-        let _ = tx_send.send(());
-    });
-
-    // Wait for either thread to finish, then exit (process teardown closes
-    // the socket and stops the remaining thread).
-    let _ = rx.recv();
-    let _ = send_handle.join();
-    let _ = recv_handle.join();
-
-    Ok(())
+    /// Shut down the connection and stop the receiving thread.
+    pub fn close(&mut self) {
+        let _ = self.write_stream.shutdown(Shutdown::Both);
+        if let Some(handle) = self.recv_handle.take() {
+            let _ = handle.join();
+        }
+    }
 }

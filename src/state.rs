@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{fingerprint, short_fingerprint, Identity};
+use crate::crypto::Identity;
 
 #[derive(Serialize, Deserialize)]
 struct StoredKeypair {
@@ -120,12 +120,98 @@ fn save_known_peers(peers: &BTreeMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// Short fingerprint for human-facing output.
-pub fn display_fingerprint(identity: &Identity) -> String {
-    short_fingerprint(&identity.public)
+/// List all trusted peers as `(address, fingerprint)` pairs, sorted by address.
+pub fn list_peers() -> Result<Vec<(String, String)>> {
+    Ok(load_known_peers()?.into_iter().collect())
 }
 
-/// Full 64-hex fingerprint, used for verification and the `trust` command.
-pub fn full_fingerprint(identity: &Identity) -> String {
-    fingerprint(&identity.public)
+/// Remove a trusted peer record.
+pub fn remove_peer(peer_id: &str) -> Result<()> {
+    let mut peers = load_known_peers()?;
+    peers.remove(peer_id);
+    save_known_peers(&peers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Env vars are process-global, so tests that set
+    /// `DIRECTMESSAGES_CONFIG_DIR` must be serialized.
+    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run the test body with `DIRECTMESSAGES_CONFIG_DIR` pointed at a unique
+    /// temp directory, so tests never touch the real user config.
+    fn with_isolated_config<T>(name: &str, f: impl FnOnce() -> T) -> T {
+        let _guard: MutexGuard<'_, ()> = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join("directmessages-tests");
+        let dir = base.join(format!("{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("DIRECTMESSAGES_CONFIG_DIR", &dir);
+        let result = f();
+        std::env::remove_var("DIRECTMESSAGES_CONFIG_DIR");
+        let _ = fs::remove_dir_all(&dir);
+        result
+    }
+
+    #[test]
+    fn tofu_lifecycle_new_verified_mismatch_remove() {
+        with_isolated_config("tofu-lifecycle", || {
+            // First contact: the peer is new.
+            assert!(matches!(
+                check_peer("127.0.0.1", "a".repeat(64).as_str()),
+                Ok(TrustDecision::New)
+            ));
+
+            // Pin it, and the same fingerprint verifies.
+            pin_peer("127.0.0.1", &"a".repeat(64)).unwrap();
+            assert!(matches!(
+                check_peer("127.0.0.1", &"a".repeat(64)),
+                Ok(TrustDecision::Verified)
+            ));
+
+            // A changed fingerprint must be flagged as a mismatch.
+            assert!(matches!(
+                check_peer("127.0.0.1", &"b".repeat(64)),
+                Ok(TrustDecision::Mismatch { .. })
+            ));
+
+            // Removing an unknown peer is a harmless no-op; removing the
+            // real one makes the peer look new again.
+            remove_peer("127.0.1.1").unwrap();
+            remove_peer("127.0.0.1").unwrap();
+            assert!(matches!(
+                check_peer("127.0.0.1", "a".repeat(64).as_str()),
+                Ok(TrustDecision::New)
+            ));
+        });
+    }
+
+    #[test]
+    fn list_peers_is_sorted_and_reflects_changes() {
+        with_isolated_config("list-peers", || {
+            assert!(list_peers().unwrap().is_empty());
+
+            pin_peer("10.0.0.2", &"b".repeat(64)).unwrap();
+            pin_peer("10.0.0.1", &"a".repeat(64)).unwrap();
+            pin_peer("10.0.0.3", &"c".repeat(64)).unwrap();
+
+            let peers = list_peers().unwrap();
+            let addrs: Vec<&str> = peers.iter().map(|(a, _)| a.as_str()).collect();
+            assert_eq!(addrs, ["10.0.0.1", "10.0.0.2", "10.0.0.3"]);
+
+            remove_peer("10.0.0.2").unwrap();
+            assert_eq!(list_peers().unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn keypair_persists_across_reloads() {
+        with_isolated_config("keypair-persist", || {
+            let first = load_or_create_keypair().unwrap();
+            let second = load_or_create_keypair().unwrap();
+            assert_eq!(*first.public.as_bytes(), *second.public.as_bytes());
+        });
+    }
 }

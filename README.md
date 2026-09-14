@@ -1,6 +1,7 @@
 # DirectMessages
 
-Encrypted peer-to-peer messenger over TCP, written in Rust.
+Encrypted peer-to-peer messenger over TCP, written in Rust, with a full
+terminal user interface (TUI).
 
 Two peers each hold a persistent X25519 keypair. When they connect, they
 perform an X25519 key exchange (ECDH) and derive a pair of directional
@@ -18,25 +19,31 @@ The binary is `target/release/directmessages` (or `directmessages.exe`).
 
 ## Usage
 
+Run the program without arguments to open the interactive interface:
+
 ```sh
-# Show this node's fingerprint
-directmessages fingerprint
-
-# Wait for an incoming connection, then chat
-directmessages listen 9000
-
-# Connect to a peer, then chat
-directmessages connect 127.0.0.1 9000
-
-# Generate a fresh keypair (overwrites the existing one)
-directmessages keygen
-
-# Manually pin a peer's fingerprint to an address (optional)
-directmessages trust <FINGERPRINT> <HOST:PORT>
+directmessages
 ```
 
-Inside a chat session, type a line and press Enter to send it. Type `/quit`
-(or `/exit`) to leave; `Ctrl-D` (or `Ctrl-Z` on Windows) also exits.
+The menu offers everything the app can do:
+
+- **Connect to peer** — enter a host/IP and port, connect, and start chatting.
+- **Listen for connection** — bind a port and wait for a peer to connect.
+- **Manage peers** — list, add, and remove trusted peers (TOFU records).
+- **Regenerate keypair** — replace your identity; the new fingerprint is shown.
+- **Quit**.
+
+Keys:
+
+| Screen      | Keys |
+| ----------- | ---- |
+| Menu        | ↑/↓ select · Enter choose · 1–5 shortcut · q/Esc quit |
+| Forms       | type to enter text · Backspace delete · Tab/↑/↓ switch field · Enter confirm · Esc back |
+| Peers       | ↑/↓ select · a add · r remove · Esc back |
+| Chat        | Enter send · ↑/↓ / PgUp/PgDn scroll history · /quit or Esc leave |
+
+Configuration directory override: set `DIRECTMESSAGES_CONFIG_DIR` to a path
+(useful for portable setups or tests).
 
 ## Security model
 
@@ -44,10 +51,11 @@ Inside a chat session, type a line and press Enter to send it. Type `/quit`
   An eavesdropper cannot read or modify messages.
 - **Trust-on-first-use (TOFU)** — the first time you talk to a peer, its
   public-key fingerprint is shown, stored, and marked as trusted. On later
-  connections, if the fingerprint changes, the connection is refused as a
-  possible man-in-the-middle attack. For strong assurance, compare the
-  displayed fingerprint with the peer out-of-band (in person, by phone, etc.)
-  on first contact.
+  connections, if the fingerprint changes, the connection is refused with a
+  security warning as a possible man-in-the-middle attack. For strong
+  assurance, compare the displayed fingerprint with the peer out-of-band
+  (in person, by phone, etc.) on first contact. You can also pin a
+  fingerprint in advance from the **Manage peers** screen.
 
 ### Known limitations (v1)
 
@@ -60,8 +68,7 @@ Inside a chat session, type a line and press Enter to send it. Type `/quit`
 - The private key is stored in plaintext in the user config directory
   (`%APPDATA%\directmessages\keypair.json` on Windows, `~/.config/directmessages/`
   on Linux/macOS), protected by the user account's filesystem permissions.
-- Incoming messages print with a simple `[peer]` prefix; there is no fancy
-  line editing or history yet.
+- One chat session at a time.
 
 ## Configuration
 

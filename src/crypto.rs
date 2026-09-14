@@ -44,12 +44,6 @@ pub fn fingerprint(public: &PublicKey) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// A short, human-friendly form of the fingerprint.
-pub fn short_fingerprint(public: &PublicKey) -> String {
-    let fp = fingerprint(public);
-    format!("fp:{}", &fp[..16])
-}
-
 /// The two directional AEAD keys derived from the ECDH shared secret.
 ///
 /// `salt` binds the keys to the specific pair of peers and prevents key
@@ -167,10 +161,6 @@ mod tests {
         let fp = fingerprint(&identity.public);
         assert_eq!(fp.len(), 64);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(
-            short_fingerprint(&identity.public),
-            format!("fp:{}", &fp[..16])
-        );
     }
 
     #[test]
