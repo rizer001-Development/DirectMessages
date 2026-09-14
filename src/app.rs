@@ -69,6 +69,15 @@ pub(crate) enum Screen {
     Notice {
         text: String,
     },
+    /// A stored fingerprint no longer matches the peer's live key. The user
+    /// must either confirm the new key (re-pin and continue) or abort.
+    Mismatch {
+        peer_id: String,
+        expected_short: String,
+        got_short: String,
+        /// Full handshake outcome, kept so "U" can continue into the chat.
+        outcome: Option<Outcome>,
+    },
     Chat(ChatSession),
 }
 
@@ -406,6 +415,32 @@ impl App {
             Screen::Notice { .. } => {
                 next = Some(Screen::Menu { selected: 0 });
             }
+            Screen::Mismatch {
+                peer_id,
+                outcome,
+                got_short,
+                ..
+            } => {
+                // Explicit confirmation re-pins the peer and continues into
+                // the chat; anything else aborts back to the menu.
+                if key.code == KeyCode::Char('u') || key.code == KeyCode::Char('U') {
+                    if let Some(outcome) = outcome.take() {
+                        let full_fp = outcome.peer_fingerprint.clone();
+                        match state::pin_peer(&outcome.peer_id, &full_fp) {
+                            Ok(()) => match build_chat_screen(outcome) {
+                                Ok(s) => next = Some(s),
+                                Err(e) => next = Some(notice(format!("failed to start chat: {e}"))),
+                            },
+                            Err(e) => next = Some(notice(format!("failed to update peer: {e}"))),
+                        }
+                    } else {
+                        next = Some(Screen::Menu { selected: 0 });
+                    }
+                } else {
+                    let _ = (peer_id, got_short);
+                    next = Some(Screen::Menu { selected: 0 });
+                }
+            }
             Screen::Chat(session) => {
                 if session.ended {
                     if key.code == KeyCode::Esc || key.code == KeyCode::Enter {
@@ -515,30 +550,35 @@ fn outcome_from_handshake(
     })
 }
 
+fn short_fp(fp: &str) -> String {
+    format!("fp:{}", &fp[..fp.len().min(16)])
+}
+
 fn build_chat_screen(outcome: Outcome) -> Result<Screen> {
-    let short = format!("fp:{}", &outcome.peer_fingerprint[..16]);
-    let notice_text = match state::check_peer(&outcome.peer_id, &outcome.peer_fingerprint)? {
+    let peer_short = short_fp(&outcome.peer_fingerprint);
+    let short = peer_short.clone();
+    match state::check_peer(&outcome.peer_id, &outcome.peer_fingerprint)? {
         TrustDecision::New => {
             state::pin_peer(&outcome.peer_id, &outcome.peer_fingerprint)?;
-            Some(format!(
+            let mut session =
+                ChatSession::new(outcome.stream, outcome.sender, outcome.receiver, peer_short)?;
+            session.push_system(format!(
                 "new peer — verify this fingerprint out-of-band: {short}"
-            ))
+            ));
+            Ok(Screen::Chat(session))
         }
-        TrustDecision::Verified => Some(format!("peer fingerprint verified: {short}")),
-        TrustDecision::Mismatch { expected } => {
-            let expected_short = format!("fp:{}", &expected[..expected.len().min(16)]);
-            return Ok(notice(format!(
-                "SECURITY WARNING: peer fingerprint for {} changed.\n\n  expected: {expected_short}\n  got:      {short}\n\nPossible man-in-the-middle attack. Connection aborted.",
-                outcome.peer_id
-            )));
+        TrustDecision::Verified => {
+            let session =
+                ChatSession::new(outcome.stream, outcome.sender, outcome.receiver, peer_short)?;
+            Ok(Screen::Chat(session))
         }
-    };
-
-    let mut session = ChatSession::new(outcome.stream, outcome.sender, outcome.receiver, short)?;
-    if let Some(n) = notice_text {
-        session.push_system(n);
+        TrustDecision::Mismatch { expected } => Ok(Screen::Mismatch {
+            peer_id: outcome.peer_id.clone(),
+            expected_short: short_fp(&expected),
+            got_short: short_fp(&outcome.peer_fingerprint),
+            outcome: Some(outcome),
+        }),
     }
-    Ok(Screen::Chat(session))
 }
 
 fn spawn_connect(

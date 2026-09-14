@@ -41,6 +41,12 @@ pub fn draw(f: &mut Frame, app: &App) {
             error,
         } => draw_add_peer(f, *focus, address, fingerprint, error.as_deref()),
         Screen::Notice { text } => draw_notice(f, text),
+        Screen::Mismatch {
+            peer_id,
+            expected_short,
+            got_short,
+            ..
+        } => draw_mismatch(f, peer_id, expected_short, got_short),
         Screen::Chat(session) => draw_chat(f, session),
     }
 }
@@ -296,6 +302,54 @@ fn draw_notice(f: &mut Frame, text: &str) {
                 .border_style(Style::default().fg(Color::Red)),
         )
         .wrap(Wrap { trim: true });
+    f.render_widget(p, area);
+}
+
+fn draw_mismatch(f: &mut Frame, peer_id: &str, expected_short: &str, got_short: &str) {
+    let area = centered(f.area(), 70, 70);
+    f.render_widget(Clear, area);
+
+    let content = vec![
+        Line::from(Span::styled(
+            "SECURITY WARNING",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "The fingerprint of peer {peer_id} changed since the"
+        )),
+        Line::from("last connection. Either the peer regenerated its"),
+        Line::from("keypair, or someone is intercepting the connection"),
+        Line::from("(man-in-the-middle)."),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  expected: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(expected_short.to_string(), Style::default().fg(Color::Red)),
+        ]),
+        Line::from(vec![
+            Span::styled("  got:      ", Style::default().fg(Color::DarkGray)),
+            Span::styled(got_short.to_string(), Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(""),
+        Line::from("Verify the new fingerprint with the peer over a"),
+        Line::from("different channel (in person, by phone, ...)."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "U trust the new key and continue · any other key abort",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    let p = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Fingerprint mismatch ")
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 

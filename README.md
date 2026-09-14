@@ -51,11 +51,43 @@ Configuration directory override: set `DIRECTMESSAGES_CONFIG_DIR` to a path
   An eavesdropper cannot read or modify messages.
 - **Trust-on-first-use (TOFU)** — the first time you talk to a peer, its
   public-key fingerprint is shown, stored, and marked as trusted. On later
-  connections, if the fingerprint changes, the connection is refused with a
-  security warning as a possible man-in-the-middle attack. For strong
-  assurance, compare the displayed fingerprint with the peer out-of-band
-  (in person, by phone, etc.) on first contact. You can also pin a
-  fingerprint in advance from the **Manage peers** screen.
+  connections, if the fingerprint changes, the app shows a security
+  warning and pauses: press **U** to trust the new key and continue (only
+  after verifying it out-of-band), or any other key to abort. You can also
+  pin a fingerprint in advance, or delete a stale record, from the
+  **Manage peers** screen.
+
+## Fingerprint mismatch (recovering after a key change)
+
+The warning fires whenever the stored fingerprint for a peer no longer
+matches the live one. Common benign causes:
+
+- the peer pressed **Regenerate keypair**;
+- the stored record is stale or was created by an older test run.
+
+Check the **expected** vs **got** fingerprints on the warning screen. If you
+know the change is legitimate (regenerated key, your own test machine), press
+**U** to re-pin and continue. If you cannot verify the new key out-of-band,
+abort and investigate — that is the MITM scenario the check exists for.
+
+## Testing on one machine
+
+Both instances share one config directory and one keypair, and a listener
+records peers by IP — so on localhost both roles resolve to the same TOFU
+slot (`127.0.0.1`), which self-matches and never warns. To test two distinct
+identities on one machine, isolate their configs:
+
+```sh
+# Terminal A
+set DIRECTMESSAGES_CONFIG_DIR=%TEMP%\dm-a && directmessages
+
+# Terminal B
+set DIRECTMESSAGES_CONFIG_DIR=%TEMP%\dm-b && directmessages
+```
+
+(PowerShell: `$env:DIRECTMESSAGES_CONFIG_DIR = "$env:TEMP\dm-a"`.)
+With isolated configs, B connecting to A produces a genuine "new peer" TOFU
+record, and the full trust flow can be exercised safely.
 
 ### Known limitations (v1)
 
