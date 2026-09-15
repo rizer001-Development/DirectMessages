@@ -1,16 +1,19 @@
 //! Cryptographic primitives: X25519 keys, fingerprints, session-key
 //! derivation, and ChaCha20-Poly1305 encryption/decryption.
 //!
-//! Session keys are derived from a triple ECDH — static-static plus both
-//! static-ephemeral shared secrets — so every session gets fresh keys (no
-//! nonce reuse across sessions) and forward secrecy (compromising a
-//! long-term key cannot decrypt past sessions).
+//! Each identity pairs a static X25519 key (key agreement) with an Ed25519
+//! signing key (handshake authentication). Session keys are derived from a
+//! quadruple ECDH — ephemeral-ephemeral, static-static, and both cross terms
+//! — so every session gets fresh keys (no nonce reuse across sessions) and
+//! forward secrecy (compromising a long-term key cannot decrypt past
+//! sessions).
 
 use anyhow::{anyhow, Context, Result};
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Key, Nonce,
 };
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
@@ -23,10 +26,18 @@ pub const MAX_MESSAGE_LEN: usize = 64 * 1024;
 /// Length in bytes of one X25519 public key.
 pub const PUBLIC_KEY_LEN: usize = 32;
 
-/// A node's persistent identity: an X25519 secret key and its public key.
+/// Length in bytes of one Ed25519 public key.
+pub const SIGNING_KEY_LEN: usize = 32;
+
+/// Length in bytes of one Ed25519 signature.
+pub const SIGNATURE_LEN: usize = 64;
+
+/// A node's persistent identity: an X25519 keypair for key agreement and an
+/// Ed25519 keypair for signing handshakes.
 pub struct Identity {
     pub secret: StaticSecret,
     pub public: PublicKey,
+    pub signing: SigningKey,
 }
 
 impl Identity {
@@ -34,15 +45,37 @@ impl Identity {
     pub fn generate() -> Self {
         let secret = StaticSecret::random_from_rng(OsRng);
         let public = PublicKey::from(&secret);
-        Identity { secret, public }
+        // The signing key is derived from the X25519 secret so a stored
+        // keypair (32 bytes) keeps deriving the same full identity.
+        let signing = signing_key_from_secret(&secret);
+        Identity {
+            secret,
+            public,
+            signing,
+        }
     }
 
     /// Rebuild an identity from a raw 32-byte secret key.
     pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
         let secret = StaticSecret::from(bytes);
         let public = PublicKey::from(&secret);
-        Identity { secret, public }
+        let signing = signing_key_from_secret(&secret);
+        Identity {
+            secret,
+            public,
+            signing,
+        }
     }
+}
+
+/// Derive the handshake-signing key from the X25519 secret via HKDF, so a
+/// single stored 32-byte secret deterministically yields the whole identity.
+fn signing_key_from_secret(secret: &StaticSecret) -> SigningKey {
+    let hk = Hkdf::<Sha256>::new(None, secret.as_bytes());
+    let mut seed = Zeroizing::new([0u8; 32]);
+    hk.expand(b"directmessages-ed25519-v1", seed.as_mut_slice())
+        .expect("32-byte OKM is valid for SHA-256");
+    SigningKey::from_bytes(seed.as_ref().try_into().expect("32-byte seed"))
 }
 
 /// A short-lived X25519 keypair generated for a single session.
@@ -64,10 +97,22 @@ impl EphemeralSecret {
     }
 }
 
-/// The SHA-256 fingerprint of a public key, hex-encoded (64 characters).
-pub fn fingerprint(public: &PublicKey) -> String {
+/// The peer's long-term and session keys, as verified during the handshake.
+pub struct PeerKeys {
+    /// Static X25519 key (the key-agreement identity).
+    pub static_public: PublicKey,
+    /// Ed25519 key that signed the ephemeral key.
+    pub signing_public: VerifyingKey,
+    /// Session-ephemeral X25519 key.
+    pub ephemeral_public: PublicKey,
+}
+
+/// The SHA-256 fingerprint of a peer's long-term keys (X25519 || Ed25519),
+/// hex-encoded (64 characters).
+pub fn fingerprint(public: &PublicKey, signing_public: &VerifyingKey) -> String {
     let mut hasher = Sha256::new();
     hasher.update(public.as_bytes());
+    hasher.update(signing_public.as_bytes());
     hex::encode(hasher.finalize())
 }
 
@@ -179,13 +224,14 @@ pub struct SessionReceiver {
 /// `my_ephemeral` and `peer_ephemeral_public` must be fresh per session; that
 /// is what makes every session's keys unique and gives forward secrecy.
 pub fn make_session(
-    secret: &StaticSecret,
+    identity: &Identity,
     my_ephemeral: &EphemeralSecret,
-    peer_public: &PublicKey,
-    peer_ephemeral_public: &PublicKey,
-    my_public: &PublicKey,
+    peer: &PeerKeys,
     is_initiator: bool,
 ) -> Result<(SessionSender, SessionReceiver)> {
+    let peer_public = &peer.static_public;
+    let peer_ephemeral_public = &peer.ephemeral_public;
+    let my_public = &identity.public;
     // Direction assignment: c2s always flows initiator -> responder. Both
     // sides must sort the ECDH inputs identically, so the roles are taken
     // from the key agreement (who is initiator), not from the caller.
@@ -200,7 +246,7 @@ pub fn make_session(
         (peer_ephemeral_public, my_ephemeral.public())
     };
     let (k_c2s, k_s2c) = derive_directional_keys(&SessionKeysInput {
-        secret,
+        secret: &identity.secret,
         ephemeral_secret: my_ephemeral,
         peer_public,
         peer_ephemeral_public,
@@ -269,7 +315,7 @@ mod tests {
     #[test]
     fn fingerprint_is_64_hex_chars() {
         let identity = Identity::generate();
-        let fp = fingerprint(&identity.public);
+        let fp = fingerprint(&identity.public, &identity.signing.verifying_key());
         assert_eq!(fp.len(), 64);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -281,24 +327,20 @@ mod tests {
         let alice_e = EphemeralSecret::generate();
         let bob_e = EphemeralSecret::generate();
 
-        let (alice_send, alice_recv) = make_session(
-            &alice.secret,
-            &alice_e,
-            &bob.public,
-            bob_e.public(),
-            &alice.public,
-            true,
-        )
-        .unwrap();
-        let (bob_send, bob_recv) = make_session(
-            &bob.secret,
-            &bob_e,
-            &alice.public,
-            alice_e.public(),
-            &bob.public,
-            false,
-        )
-        .unwrap();
+        let alice_peer_keys = PeerKeys {
+            static_public: bob.public,
+            signing_public: bob.signing.verifying_key(),
+            ephemeral_public: *bob_e.public(),
+        };
+        let bob_peer_keys = PeerKeys {
+            static_public: alice.public,
+            signing_public: alice.signing.verifying_key(),
+            ephemeral_public: *alice_e.public(),
+        };
+
+        let (alice_send, alice_recv) =
+            make_session(&alice, &alice_e, &alice_peer_keys, true).unwrap();
+        let (bob_send, bob_recv) = make_session(&bob, &bob_e, &bob_peer_keys, false).unwrap();
 
         // Alice -> Bob
         let mut a_send = alice_send;
@@ -321,24 +363,18 @@ mod tests {
         let bob = Identity::generate();
         let alice_e = EphemeralSecret::generate();
         let bob_e = EphemeralSecret::generate();
-        let (mut a_send, _) = make_session(
-            &alice.secret,
-            &alice_e,
-            &bob.public,
-            bob_e.public(),
-            &alice.public,
-            true,
-        )
-        .unwrap();
-        let (_, mut b_recv) = make_session(
-            &bob.secret,
-            &bob_e,
-            &alice.public,
-            alice_e.public(),
-            &bob.public,
-            false,
-        )
-        .unwrap();
+        let alice_peer_keys = PeerKeys {
+            static_public: bob.public,
+            signing_public: bob.signing.verifying_key(),
+            ephemeral_public: *bob_e.public(),
+        };
+        let bob_peer_keys = PeerKeys {
+            static_public: alice.public,
+            signing_public: alice.signing.verifying_key(),
+            ephemeral_public: *alice_e.public(),
+        };
+        let (mut a_send, _) = make_session(&alice, &alice_e, &alice_peer_keys, true).unwrap();
+        let (_, mut b_recv) = make_session(&bob, &bob_e, &bob_peer_keys, false).unwrap();
 
         let mut ciphertext = a_send.encrypt(b"important").unwrap();
         ciphertext[0] ^= 0xff;
@@ -353,15 +389,13 @@ mod tests {
         fn session_ciphertext(alice: &Identity, bob: &Identity, message: &[u8]) -> Vec<u8> {
             let alice_e = EphemeralSecret::generate();
             let bob_e = EphemeralSecret::generate();
-            let (mut a_send, _b_recv) = make_session(
-                &alice.secret,
-                &alice_e,
-                &bob.public,
-                bob_e.public(),
-                &alice.public,
-                true,
-            )
-            .unwrap();
+            let alice_peer_keys = PeerKeys {
+                static_public: bob.public,
+                signing_public: bob.signing.verifying_key(),
+                ephemeral_public: *bob_e.public(),
+            };
+            let (mut a_send, _b_recv) =
+                make_session(alice, &alice_e, &alice_peer_keys, true).unwrap();
             a_send.encrypt(message).unwrap()
         }
 
@@ -380,23 +414,47 @@ mod tests {
         let bob = Identity::generate();
         let bob_e = EphemeralSecret::generate();
         let zero = PublicKey::from([0u8; 32]);
-        assert!(make_session(
-            &alice.secret,
-            &alice_e,
-            &zero,
-            bob_e.public(),
-            &alice.public,
-            true
-        )
-        .is_err());
-        assert!(make_session(
-            &alice.secret,
-            &alice_e,
-            &bob.public,
-            &zero,
-            &alice.public,
-            true
-        )
-        .is_err());
+        let zero_peer = PeerKeys {
+            static_public: zero,
+            signing_public: bob.signing.verifying_key(),
+            ephemeral_public: *bob_e.public(),
+        };
+        let degenerate_peer = PeerKeys {
+            static_public: bob.public,
+            signing_public: bob.signing.verifying_key(),
+            ephemeral_public: zero,
+        };
+        assert!(make_session(&alice, &alice_e, &zero_peer, true).is_err());
+        assert!(make_session(&alice, &alice_e, &degenerate_peer, true).is_err());
+    }
+
+    #[test]
+    fn fingerprint_binds_both_longterm_keys() {
+        let identity = Identity::generate();
+        let fp = fingerprint(&identity.public, &identity.signing.verifying_key());
+        assert_eq!(fp.len(), 64);
+        assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // A different signing key (e.g. an attacker's) must yield a
+        // different fingerprint for the same static key.
+        let other = Identity::generate();
+        assert_ne!(
+            fp,
+            fingerprint(&identity.public, &other.signing.verifying_key())
+        );
+    }
+
+    #[test]
+    fn identity_is_deterministic_from_secret_bytes() {
+        let seed = {
+            use rand::RngCore;
+            let mut s = [0u8; 32];
+            OsRng.fill_bytes(&mut s);
+            s
+        };
+        let a = Identity::from_secret_bytes(seed);
+        let b = Identity::from_secret_bytes(seed);
+        assert_eq!(*a.public.as_bytes(), *b.public.as_bytes());
+        assert_eq!(a.signing.to_bytes(), b.signing.to_bytes());
     }
 }

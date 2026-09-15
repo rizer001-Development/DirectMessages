@@ -3,12 +3,13 @@
 Encrypted peer-to-peer messenger over TCP, written in Rust, with a full
 terminal user interface (TUI).
 
-Two peers each hold a persistent X25519 keypair. When they connect, they
-exchange an ephemeral keypair plus their static key (64 bytes each side) and
-derive a pair of directional ChaCha20-Poly1305 session keys via HKDF-SHA256
-from a **quadruple ECDH** (ephemeral–ephemeral, static–static, and both cross
-terms). Every message is encrypted and integrity-protected (AEAD) with a
-per-message, per-direction nonce counter.
+Two peers each hold a persistent X25519 keypair paired with an Ed25519 signing
+key (derived from the same 32-byte secret). When they connect, they exchange an
+ephemeral keypair plus their static and signing keys (160 bytes each side) and
+sign a transcript binding all keys of the session. Session keys are derived
+via HKDF-SHA256 from a **quadruple ECDH** (ephemeral–ephemeral, static–static,
+and both cross terms). Every message is encrypted and integrity-protected
+(AEAD) with a per-message, per-direction nonce counter.
 
 ## Building
 
@@ -50,6 +51,11 @@ Configuration directory override: set `DIRECTMESSAGES_CONFIG_DIR` to a path
 
 - **Confidentiality & integrity** — X25519 ECDH (static + ephemeral) +
   ChaCha20-Poly1305 (AEAD). An eavesdropper cannot read or modify messages.
+- **Handshake authentication** — each side signs the session transcript
+  (both long-term keys and both ephemeral keys) with its Ed25519 key, so a
+  session is cryptographically bound to the identity that TOFU pins. A
+  machine-in-the-middle must either keep its own key (which breaks the
+  pinned fingerprint) or fail signature verification.
 - **Forward secrecy** — session keys mix in fresh ephemeral ECDH output, so
   compromising a long-term key cannot decrypt previously recorded sessions.
 - **Unique session keys** — every session derives fresh keys, so the
@@ -70,7 +76,10 @@ The warning fires whenever the stored fingerprint for a peer no longer
 matches the live one. Common benign causes:
 
 - the peer pressed **Regenerate keypair**;
-- the stored record is stale or was created by an older test run.
+- the stored record is stale or was created by an older test run;
+- **one side was upgraded from v0.1/v0.2 to v0.3** — fingerprints now cover
+  both the X25519 and the Ed25519 key, so records pinned by older versions
+  no longer match. Verify the new fingerprint and press **U** once.
 
 Check the **expected** vs **got** fingerprints on the warning screen. If you
 know the change is legitimate (regenerated key, your own test machine), press
@@ -98,10 +107,6 @@ record, and the full trust flow can be exercised safely.
 
 ### Known limitations
 
-- The handshake itself is unauthenticated; a machine-in-the-middle during the
-  very first connection (before TOFU pins the fingerprint) would be visible
-  only through fingerprint verification out-of-band. A future version can add
-  Ed25519 signatures over the ephemeral keys for explicit authentication.
 - The listener records a peer's fingerprint keyed by the peer's IP address
   (not its port); two peers behind the same IP/NAT share a TOFU slot.
 - The private key is stored in plaintext in the user config directory
@@ -113,8 +118,10 @@ record, and the full trust flow can be exercised safely.
 
 State lives in the per-user config directory under `directmessages/`:
 
-- `keypair.json` — the X25519 secret key (hex). The fingerprint of its public
-  key is what TOFU pins; it does not change when ephemeral keys rotate.
+- `keypair.json` — the X25519 secret key (hex). The Ed25519 signing key is
+  derived from it via HKDF, so the one stored secret defines the whole
+  identity. The fingerprint of the X25519 + Ed25519 public keys is what TOFU
+  pins; it does not change when ephemeral keys rotate.
 - `known_peers.json` — TOFU map of peer address → trusted fingerprint.
 
 ## License

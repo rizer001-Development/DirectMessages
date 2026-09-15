@@ -105,7 +105,8 @@ pub(crate) struct Outcome {
 impl App {
     pub fn new() -> Result<Self> {
         let identity = Arc::new(state::load_or_create_keypair()?);
-        let my_fingerprint = crypto::fingerprint(&identity.public);
+        let my_fingerprint =
+            crypto::fingerprint(&identity.public, &identity.signing.verifying_key());
         Ok(App {
             identity,
             my_fingerprint,
@@ -517,7 +518,7 @@ fn menu_action(
         }),
         3 => match state::generate_and_save() {
             Ok(id) => {
-                let fp = crypto::fingerprint(&id.public);
+                let fp = crypto::fingerprint(&id.public, &id.signing.verifying_key());
                 *my_fingerprint = fp.clone();
                 *identity = Arc::new(id);
                 Some(notice(format!("new keypair generated\nfingerprint: {fp}")))
@@ -538,9 +539,9 @@ fn outcome_from_handshake(
     is_initiator: bool,
     peer_id: String,
 ) -> Result<Outcome> {
-    let (sender, receiver, peer_public) =
+    let (sender, receiver, peer) =
         protocol::perform_handshake(&mut stream, is_initiator, identity)?;
-    let peer_fingerprint = crypto::fingerprint(&peer_public);
+    let peer_fingerprint = crypto::fingerprint(&peer.static_public, &peer.signing_public);
     Ok(Outcome {
         stream,
         sender,
