@@ -1,45 +1,69 @@
 //! Wire protocol: the X25519 handshake and length-prefixed message framing.
+//!
+//! The handshake sends each side's ephemeral public key followed by its
+//! static public key (64 bytes total). Session keys are derived from the
+//! triple ECDH, so every session gets fresh keys and forward secrecy; the
+//! static keys are what TOFU fingerprints authenticate.
 
 use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result};
 use x25519_dalek::PublicKey;
 
-use crate::crypto::{Identity, SessionReceiver, SessionSender, MAX_MESSAGE_LEN};
+use crate::crypto::{
+    EphemeralSecret, Identity, SessionReceiver, SessionSender, MAX_MESSAGE_LEN, PUBLIC_KEY_LEN,
+};
 
 /// Exchange public keys and derive the session keys.
 ///
-/// The initiator sends its public key first; the responder replies with its
-/// own. Both sides then derive the same pair of directional keys.
+/// Each side sends `ephemeral_pk || static_pk` (64 bytes). The initiator
+/// sends first; the responder replies with its own bundle. Both sides then
+/// derive the same pair of directional keys from the triple ECDH.
 pub fn perform_handshake<S: Read + Write>(
     stream: &mut S,
     is_initiator: bool,
     identity: &Identity,
 ) -> Result<(SessionSender, SessionReceiver, PublicKey)> {
-    let mut peer_bytes = [0u8; 32];
+    let ephemeral = EphemeralSecret::generate();
+
+    let mut my_bundle = [0u8; 2 * PUBLIC_KEY_LEN];
+    my_bundle[..PUBLIC_KEY_LEN].copy_from_slice(ephemeral.public().as_bytes());
+    my_bundle[PUBLIC_KEY_LEN..].copy_from_slice(identity.public.as_bytes());
+
+    let mut peer_bundle = [0u8; 2 * PUBLIC_KEY_LEN];
 
     if is_initiator {
         stream
-            .write_all(identity.public.as_bytes())
-            .context("failed to send public key")?;
-        stream.flush().context("failed to flush public key")?;
+            .write_all(&my_bundle)
+            .context("failed to send key bundle")?;
+        stream.flush().context("failed to flush key bundle")?;
         stream
-            .read_exact(&mut peer_bytes)
-            .context("failed to read peer public key")?;
+            .read_exact(&mut peer_bundle)
+            .context("failed to read peer key bundle")?;
     } else {
         stream
-            .read_exact(&mut peer_bytes)
-            .context("failed to read peer public key")?;
+            .read_exact(&mut peer_bundle)
+            .context("failed to read peer key bundle")?;
         stream
-            .write_all(identity.public.as_bytes())
-            .context("failed to send public key")?;
-        stream.flush().context("failed to flush public key")?;
+            .write_all(&my_bundle)
+            .context("failed to send key bundle")?;
+        stream.flush().context("failed to flush key bundle")?;
     }
 
+    // The bundle is `ephemeral_pk || static_pk`; parse it in that order.
+    let mut peer_ephemeral_bytes = [0u8; PUBLIC_KEY_LEN];
+    peer_ephemeral_bytes.copy_from_slice(&peer_bundle[..PUBLIC_KEY_LEN]);
+    let peer_ephemeral_public = PublicKey::from(peer_ephemeral_bytes);
+
+    let mut peer_bytes = [0u8; PUBLIC_KEY_LEN];
+    peer_bytes.copy_from_slice(&peer_bundle[PUBLIC_KEY_LEN..]);
     let peer_public = PublicKey::from(peer_bytes);
+
     let (sender, receiver) = crate::crypto::make_session(
         &identity.secret,
+        &ephemeral,
         &peer_public,
+        &peer_ephemeral_public,
         &identity.public,
         is_initiator,
     )?;
@@ -117,8 +141,6 @@ mod tests {
         use std::net::{TcpListener, TcpStream};
         use std::thread;
 
-        use crate::crypto::Identity;
-
         let alice = Identity::generate();
         let bob = Identity::generate();
         let alice_public_bytes = *alice.public.as_bytes();
@@ -158,5 +180,52 @@ mod tests {
         let (server_peer_bytes, server_plaintext) = server.join().unwrap();
         assert_eq!(server_peer_bytes, alice_public_bytes);
         assert_eq!(server_plaintext, b"from-client");
+    }
+
+    #[test]
+    fn two_handshakes_derive_independent_sessions() {
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        // Same static identities, same plaintext, two separate sessions:
+        // fresh ephemeral keys per handshake must yield different ciphertexts,
+        // and each session's ciphertext must decrypt only in that session.
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let message = b"same plaintext";
+
+        fn run_session(alice: &Identity, bob: &Identity, message: &[u8]) -> Vec<u8> {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let bob = Identity::from_secret_bytes(*bob.secret.as_bytes());
+            let server_message = message.to_vec();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (mut sender, mut receiver, _peer_pk) =
+                    perform_handshake(&mut stream, false, &bob).unwrap();
+                let ciphertext = sender.encrypt(&server_message).unwrap();
+                write_frame(&mut stream, &ciphertext).unwrap();
+                let frame = read_frame(&mut stream).unwrap();
+                (ciphertext, receiver.decrypt(&frame).unwrap())
+            });
+
+            let mut stream = TcpStream::connect(addr).unwrap();
+            let (mut sender, mut receiver, _peer_pk) =
+                perform_handshake(&mut stream, true, alice).unwrap();
+            let frame = read_frame(&mut stream).unwrap();
+            let decrypted = receiver.decrypt(&frame).unwrap();
+            assert_eq!(decrypted, message);
+            let ciphertext = sender.encrypt(message).unwrap();
+            write_frame(&mut stream, &ciphertext).unwrap();
+
+            let (server_ct, server_roundtrip) = server.join().unwrap();
+            assert_eq!(server_roundtrip, message);
+            server_ct
+        }
+
+        let ct_one = run_session(&alice, &bob, message);
+        let ct_two = run_session(&alice, &bob, message);
+
+        assert_ne!(ct_one, ct_two);
     }
 }

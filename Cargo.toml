@@ -1,6 +1,6 @@
 [package]
 name = "directmessages"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "DirectMessages - encrypted peer-to-peer messenger over TCP (Rust)"
 license = "AGPL-3.0"

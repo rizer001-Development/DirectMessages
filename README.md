@@ -4,10 +4,11 @@ Encrypted peer-to-peer messenger over TCP, written in Rust, with a full
 terminal user interface (TUI).
 
 Two peers each hold a persistent X25519 keypair. When they connect, they
-perform an X25519 key exchange (ECDH) and derive a pair of directional
-ChaCha20-Poly1305 session keys via HKDF-SHA256. Every message is encrypted
-and integrity-protected (AEAD) with a per-message, per-direction nonce
-counter.
+exchange an ephemeral keypair plus their static key (64 bytes each side) and
+derive a pair of directional ChaCha20-Poly1305 session keys via HKDF-SHA256
+from a **quadruple ECDH** (ephemeral–ephemeral, static–static, and both cross
+terms). Every message is encrypted and integrity-protected (AEAD) with a
+per-message, per-direction nonce counter.
 
 ## Building
 
@@ -47,8 +48,14 @@ Configuration directory override: set `DIRECTMESSAGES_CONFIG_DIR` to a path
 
 ## Security model
 
-- **Confidentiality & integrity** — X25519 ECDH + ChaCha20-Poly1305 (AEAD).
-  An eavesdropper cannot read or modify messages.
+- **Confidentiality & integrity** — X25519 ECDH (static + ephemeral) +
+  ChaCha20-Poly1305 (AEAD). An eavesdropper cannot read or modify messages.
+- **Forward secrecy** — session keys mix in fresh ephemeral ECDH output, so
+  compromising a long-term key cannot decrypt previously recorded sessions.
+- **Unique session keys** — every session derives fresh keys, so the
+  (key, nonce) pair is never reused across sessions.
+- **Degenerate-key rejection** — all-zero peer public keys are rejected
+  before key derivation.
 - **Trust-on-first-use (TOFU)** — the first time you talk to a peer, its
   public-key fingerprint is shown, stored, and marked as trusted. On later
   connections, if the fingerprint changes, the app shows a security
@@ -89,12 +96,12 @@ set DIRECTMESSAGES_CONFIG_DIR=%TEMP%\dm-b && directmessages
 With isolated configs, B connecting to A produces a genuine "new peer" TOFU
 record, and the full trust flow can be exercised safely.
 
-### Known limitations (v1)
+### Known limitations
 
-- **No forward secrecy** — the long-term X25519 keys are used directly, so
-  compromising one of them would decrypt all past and future sessions with
-  that peer. A future version can add ephemeral session keys signed by a
-  long-term Ed25519 identity.
+- The handshake itself is unauthenticated; a machine-in-the-middle during the
+  very first connection (before TOFU pins the fingerprint) would be visible
+  only through fingerprint verification out-of-band. A future version can add
+  Ed25519 signatures over the ephemeral keys for explicit authentication.
 - The listener records a peer's fingerprint keyed by the peer's IP address
   (not its port); two peers behind the same IP/NAT share a TOFU slot.
 - The private key is stored in plaintext in the user config directory
@@ -106,7 +113,8 @@ record, and the full trust flow can be exercised safely.
 
 State lives in the per-user config directory under `directmessages/`:
 
-- `keypair.json` — the X25519 secret key (hex).
+- `keypair.json` — the X25519 secret key (hex). The fingerprint of its public
+  key is what TOFU pins; it does not change when ephemeral keys rotate.
 - `known_peers.json` — TOFU map of peer address → trusted fingerprint.
 
 ## License
